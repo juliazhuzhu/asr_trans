@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -56,7 +55,7 @@ func NewAudioTranscriber(host string, port int, audioIn string) *AudioTranscribe
 }
 
 // Run 启动音频转写
-func (at *AudioTranscriber) Run() string {
+func (at *AudioTranscriber) Run() []map[string]interface{} {
 	if at.AudioIn == "" {
 		log.Fatal("audio_in is required")
 	}
@@ -67,16 +66,17 @@ func (at *AudioTranscriber) Run() string {
 	at.setupSignalHandler(cancel)
 	wavs, _ := at.splitWavFile(at.AudioIn, 10, 10, 60000)
 
-	resultChan := make(chan string, len(wavs))
+	resultChan := make(chan map[string]interface{}, len(wavs))
 	var wg sync.WaitGroup
 	wg.Add(1)
 	defer wg.Done()
+	offset := 3600000
 	for i, wavPath := range wavs {
-		at.wsClient(ctx, i, wavPath, resultChan)
+		at.wsClient(ctx, i, wavPath, resultChan, float64(i*offset))
 	}
 	close(resultChan)
 	at.cleanupSplitFiles()
-	var results []string
+	var results []map[string]interface{}
 	for res := range resultChan {
 		results = append(results, res)
 	}
@@ -84,7 +84,7 @@ func (at *AudioTranscriber) Run() string {
 		wg.Wait()
 
 	}()
-	return strings.Join(results, " ")
+	return results
 }
 
 // 捕获退出信号
@@ -195,12 +195,12 @@ func min(a, b int) int {
 }
 
 // WebSocket客户端
-func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string, resultChan chan<- string) {
+func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string, resultChan chan<- map[string]interface{}, offset float64) {
 	u := url.URL{Scheme: "wss", Host: fmt.Sprintf("%s:%d", at.Host, at.Port), Path: "/"}
 	websocket.DefaultDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
-		resultChan <- ""
+		resultChan <- nil
 		log.Fatal("连接失败:", err)
 	}
 	defer c.Close()
@@ -211,10 +211,11 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	go func() {
 		//defer close(done)
 		for {
+
 			select {
 			case <-ctx.Done():
 				done <- struct{}{}
-				resultChan <- ""
+				resultChan <- nil
 				return
 			default:
 				_, msg, err := c.ReadMessage()
@@ -226,13 +227,39 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 				if err := json.Unmarshal(msg, &result); err != nil {
 					log.Println("解析JSON失败:", err)
 					done <- struct{}{}
-					resultChan <- ""
+					resultChan <- nil
 					return
 				}
-				if text, ok := result["text"].(string); ok {
-					resultChan <- text
-					log.Println("done part.")
+				fmt.Printf("offset %d \n", offset)
+				if stamps, ok := result["stamp_sents"].([]interface{}); ok {
+					for i, val := range stamps {
+						if valMap, ok := val.(map[string]interface{}); ok {
+							fmt.Println(valMap["end"])
+							fmt.Printf("Type of valMap[\"end\"]: %T\n", valMap["end"])
+							if endVal, exists := valMap["end"].(float64); exists {
+								// 修改值
+								valMap["end"] = endVal + offset
+								// 如果需要将修改后的 map 放回 stamps 切片中
+								stamps[i] = valMap
+							}
+
+							if startVal, exists := valMap["start"].(float64); exists {
+								// 修改值
+								valMap["start"] = startVal + offset
+								// 如果需要将修改后的 map 放回 stamps 切片中
+								stamps[i] = valMap
+							}
+						}
+
+					}
+					result["stamp_sents"] = stamps
+					log.Println(result)
+					if _, ok := result["text"].(string); ok {
+						resultChan <- result
+						log.Println("done part.")
+					}
 				}
+
 				done <- struct{}{}
 				return
 			}
@@ -266,12 +293,12 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	if err != nil {
 		return
 	}
-	fmt.Println("len audio bytes", len(audioBytes))
+	//fmt.Println("len audio bytes", len(audioBytes))
 	//stride := int(60 * 10 * sampleRate * 2 / chunkInterval / 1000) // Simplified calculation for stride
 	// 假设 chunkSize 是 int16 类型，sampleRate 是 uint32 类型
 	stride := int(float64(60) * float64(config.ChunkSize[1]) * float64(config.AudioFS) * 2.0 / float64(config.ChunkInterval) / 1000.0)
 	chunkNum := (len(audioBytes)-1)/stride + 1
-	fmt.Printf("chunkNum %d \n", chunkNum)
+	//fmt.Printf("chunkNum %d \n", chunkNum)
 	//chunkSize := int(16000 / 1000 * 10)
 	//chunkSize := stride
 	//chunkSize := int(16000 / 1000 * 10)
@@ -302,7 +329,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 		IsSpeaking: false,
 	}
 	endMsg, _ := json.Marshal(end)
-	fmt.Printf("end speaking. \n")
+	log.Println("end speaking.")
 	if err := c.WriteMessage(websocket.TextMessage, endMsg); err != nil {
 		log.Fatal("发送结束标记失败:", err)
 	}
