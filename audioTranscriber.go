@@ -230,12 +230,10 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 					resultChan <- nil
 					return
 				}
-				fmt.Printf("offset %d \n", offset)
+				//fmt.Printf("offset %d \n", offset)
 				if stamps, ok := result["stamp_sents"].([]interface{}); ok {
 					for i, val := range stamps {
 						if valMap, ok := val.(map[string]interface{}); ok {
-							fmt.Println(valMap["end"])
-							fmt.Printf("Type of valMap[\"end\"]: %T\n", valMap["end"])
 							if endVal, exists := valMap["end"].(float64); exists {
 								// 修改值
 								valMap["end"] = endVal + offset
@@ -253,7 +251,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 
 					}
 					result["stamp_sents"] = stamps
-					log.Println(result)
+					//log.Println(result)
 					if _, ok := result["text"].(string); ok {
 						resultChan <- result
 						log.Println("done part.")
