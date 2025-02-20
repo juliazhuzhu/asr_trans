@@ -23,12 +23,14 @@ func main() {
 			for _, val := range stamps {
 				//iterate every sentence.
 				if valMap, ok := val.(map[string]interface{}); ok {
-					fmt.Printf("start %v, end %v, text:%s\n", valMap["start"], valMap["end"], valMap["text_seg"])
+					fmt.Printf("start %v, end %v, text:%s %s\n", valMap["start"], valMap["end"], valMap["text_seg"], valMap["punc"])
 				}
 
 			}
 			//get whole chapter
-			fmt.Println(result["text"])
+			if _, ok := result["text"].(string); ok {
+				fmt.Println(result["text"])
+			}
 		}
 	}
 
