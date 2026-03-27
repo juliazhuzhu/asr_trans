@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+
+	//"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -43,6 +45,33 @@ type Message struct {
 
 type EndMessage struct {
 	IsSpeaking bool `json:"is_speaking"`
+}
+
+// Sentence 带说话人信息的句子
+type Sentence struct {
+	Text      string      `json:"text"`
+	Start     float64     `json:"start"`
+	End       float64     `json:"end"`
+	Speaker   string      `json:"speaker"`
+	Timestamp [][]float64 `json:"timestamp"`
+}
+
+// StampSent 时间戳句子信息
+type StampSent struct {
+	TextSeg string      `json:"text_seg"`
+	Punc    string      `json:"punc"`
+	Start   float64     `json:"start"`
+	End     float64     `json:"end"`
+	TsList  [][]float64 `json:"ts_list"`
+}
+
+// ASRResult ASR识别结果
+type ASRResult struct {
+	IsFinal    string      `json:"is_final"`
+	Text       string      `json:"text"`
+	Timestamp  [][]float64 `json:"timestamp"`
+	StampSents []StampSent `json:"stamp_sents"`
+	Sentences  []Sentence  `json:"sentences"`
 }
 
 // NewAudioTranscriber 创建一个新的音频转写客户端
@@ -198,6 +227,7 @@ func min(a, b int) int {
 func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string, resultChan chan<- map[string]interface{}, offset float64) {
 	u := url.URL{Scheme: "wss", Host: fmt.Sprintf("%s:%d", at.Host, at.Port), Path: "/"}
 	websocket.DefaultDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		resultChan <- nil
@@ -223,41 +253,54 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 					log.Println("读取消息失败:", err)
 					return
 				}
-				var result map[string]interface{}
-				if err := json.Unmarshal(msg, &result); err != nil {
+				var asrResult ASRResult
+				if err := json.Unmarshal(msg, &asrResult); err != nil {
 					log.Println("解析JSON失败:", err)
 					done <- struct{}{}
 					resultChan <- nil
 					return
 				}
-				//fmt.Printf("offset %d \n", offset)
-				if stamps, ok := result["stamp_sents"].([]interface{}); ok {
-					for i, val := range stamps {
-						if valMap, ok := val.(map[string]interface{}); ok {
-							if endVal, exists := valMap["end"].(float64); exists {
-								// 修改值
-								valMap["end"] = endVal + offset
-								// 如果需要将修改后的 map 放回 stamps 切片中
-								stamps[i] = valMap
-							}
 
-							if startVal, exists := valMap["start"].(float64); exists {
-								// 修改值
-								valMap["start"] = startVal + offset
-								// 如果需要将修改后的 map 放回 stamps 切片中
-								stamps[i] = valMap
-							}
-						}
+				// 检查是否是最终结果
+				if asrResult.IsFinal != "True" {
+					return
+				}
 
-					}
-					result["stamp_sents"] = stamps
-					//log.Println(result)
-					if _, ok := result["text"].(string); ok {
-						resultChan <- result
-						log.Println("done part.")
+				// 调整 stamp_sents 中的时间戳
+				for i := range asrResult.StampSents {
+					asrResult.StampSents[i].Start += offset
+					asrResult.StampSents[i].End += offset
+					// 调整 ts_list 中的时间戳
+					for j := range asrResult.StampSents[i].TsList {
+						asrResult.StampSents[i].TsList[j][0] += offset
+						asrResult.StampSents[i].TsList[j][1] += offset
 					}
 				}
 
+				// 调整 sentences 中的时间戳
+				for i := range asrResult.Sentences {
+					asrResult.Sentences[i].Start += offset
+					asrResult.Sentences[i].End += offset
+					// 调整 timestamp 中的时间戳
+					for j := range asrResult.Sentences[i].Timestamp {
+						asrResult.Sentences[i].Timestamp[j][0] += offset
+						asrResult.Sentences[i].Timestamp[j][1] += offset
+					}
+				}
+
+				// 调整顶层 timestamp
+				for i := range asrResult.Timestamp {
+					asrResult.Timestamp[i][0] += offset
+					asrResult.Timestamp[i][1] += offset
+				}
+
+				// 转换为 map 返回
+				resultBytes, _ := json.Marshal(asrResult)
+				var result map[string]interface{}
+				json.Unmarshal(resultBytes, &result)
+
+				resultChan <- result
+				log.Println("done part.")
 				done <- struct{}{}
 				return
 			}
@@ -294,7 +337,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	//fmt.Println("len audio bytes", len(audioBytes))
 	//stride := int(60 * 10 * sampleRate * 2 / chunkInterval / 1000) // Simplified calculation for stride
 	// 假设 chunkSize 是 int16 类型，sampleRate 是 uint32 类型
-	stride := int(float64(60) * float64(config.ChunkSize[1]) * float64(config.AudioFS) * 2.0 / float64(config.ChunkInterval) / 1000.0)
+	stride := int(float64(600) * float64(config.ChunkSize[1]) * float64(config.AudioFS) * 2.0 / float64(config.ChunkInterval) / 1000.0)
 	chunkNum := (len(audioBytes)-1)/stride + 1
 	//fmt.Printf("chunkNum %d \n", chunkNum)
 	//chunkSize := int(16000 / 1000 * 10)
