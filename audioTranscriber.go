@@ -27,6 +27,7 @@ type AudioTranscriber struct {
 	Port       int
 	AudioIn    string
 	SplitFiles []string // 记录新增的分割文件路径
+	SessionID  string   // 会话 ID，用于跨片段说话人一致性
 	mu         sync.Mutex
 }
 
@@ -41,6 +42,7 @@ type Message struct {
 	Itn           bool   `json:"itn"`
 	AudioFS       int    `json:"audio_fs"`
 	WavFormat     string `json:"wav_format"`
+	SessionID     string `json:"session_id,omitempty"`
 }
 
 type EndMessage struct {
@@ -95,6 +97,12 @@ func (at *AudioTranscriber) Run() []map[string]interface{} {
 	at.setupSignalHandler(cancel)
 	wavs, _ := at.splitWavFile(at.AudioIn, 10, 10, 60000)
 
+	// 生成 session ID 用于跨片段说话人一致性
+	if at.SessionID == "" {
+		at.SessionID = fmt.Sprintf("session-%d", time.Now().UnixNano())
+	}
+	log.Printf("Session ID: %s", at.SessionID)
+
 	resultChan := make(chan map[string]interface{}, len(wavs))
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -103,6 +111,10 @@ func (at *AudioTranscriber) Run() []map[string]interface{} {
 	for i, wavPath := range wavs {
 		at.wsClient(ctx, i, wavPath, resultChan, float64(i*offset))
 	}
+
+	// 所有片段发送完成后，发送 session_end 消息
+	at.sendSessionEnd()
+
 	close(resultChan)
 	at.cleanupSplitFiles()
 	var results []map[string]interface{}
@@ -223,6 +235,36 @@ func min(a, b int) int {
 	return b
 }
 
+// sendSessionEnd 发送 session 结束消息，通知服务端清理说话人注册表
+func (at *AudioTranscriber) sendSessionEnd() {
+	u := url.URL{Scheme: "wss", Host: fmt.Sprintf("%s:%d", at.Host, at.Port), Path: "/"}
+	websocket.DefaultDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Printf("session_end: 连接失败: %v", err)
+		return
+	}
+	defer c.Close()
+
+	endMsg, _ := json.Marshal(map[string]interface{}{
+		"session_end": true,
+		"session_id":  at.SessionID,
+	})
+	if err := c.WriteMessage(websocket.TextMessage, endMsg); err != nil {
+		log.Printf("session_end: 发送失败: %v", err)
+		return
+	}
+
+	// 等待服务端确认
+	_, msg, err := c.ReadMessage()
+	if err != nil {
+		log.Printf("session_end: 读取响应失败: %v", err)
+		return
+	}
+	log.Printf("session_end: 服务端响应: %s", string(msg))
+}
+
 // WebSocket客户端
 func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string, resultChan chan<- map[string]interface{}, offset float64) {
 	u := url.URL{Scheme: "wss", Host: fmt.Sprintf("%s:%d", at.Host, at.Port), Path: "/"}
@@ -318,6 +360,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 		Itn:           true,
 		AudioFS:       16000,
 		WavFormat:     "pcm",
+		SessionID:     at.SessionID,
 	}
 
 	configMsg, _ := json.Marshal(config)

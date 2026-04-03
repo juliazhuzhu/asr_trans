@@ -17,6 +17,7 @@ func main() {
 	}
 
 	transcriber := NewAudioTranscriber(*host, *port, *audioIn)
+
 	ret := transcriber.Run()
 	for _, result := range ret {
 		// 解析 sentences 字段（包含 speaker 信息）
