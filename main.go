@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
+	"os"
 )
 
 func main() {
@@ -13,12 +13,17 @@ func main() {
 	flag.Parse()
 
 	if *audioIn == "" {
-		log.Fatal("必须指定 audio_in 参数")
+		fmt.Fprintln(os.Stderr, "必须指定 audio_in 参数")
+		os.Exit(1)
 	}
 
 	transcriber := NewAudioTranscriber(*host, *port, *audioIn)
 
-	ret := transcriber.Run()
+	ret, err := transcriber.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "转写失败: %v\n", err)
+		os.Exit(1)
+	}
 	for _, result := range ret {
 		// 解析 sentences 字段（包含 speaker 信息）
 		if sentences, ok := result["sentences"].([]interface{}); ok {

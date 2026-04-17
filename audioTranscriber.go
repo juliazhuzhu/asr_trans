@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
@@ -87,16 +88,19 @@ func NewAudioTranscriber(host string, port int, audioIn string) *AudioTranscribe
 }
 
 // Run 启动音频转写
-func (at *AudioTranscriber) Run() []map[string]interface{} {
+func (at *AudioTranscriber) Run() ([]map[string]interface{}, error) {
 	if at.AudioIn == "" {
-		log.Fatal("audio_in is required")
+		return nil, fmt.Errorf("audio_in is required")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	at.setupSignalHandler(cancel)
-	wavs, _ := at.splitWavFile(at.AudioIn, 10, 10, 60000)
+	wavs, err := at.splitWavFile(at.AudioIn, 10, 10, 60000)
+	if err != nil {
+		return nil, fmt.Errorf("split wav file failed: %w", err)
+	}
 
 	// 生成 session ID 用于跨片段说话人一致性
 	if at.SessionID == "" {
@@ -110,7 +114,10 @@ func (at *AudioTranscriber) Run() []map[string]interface{} {
 	defer wg.Done()
 	offset := 3600000
 	for i, wavPath := range wavs {
-		at.wsClient(ctx, i, wavPath, resultChan, float64(i*offset))
+		if err := at.wsClient(ctx, i, wavPath, resultChan, float64(i*offset)); err != nil {
+			return nil, fmt.Errorf("wsClient(%d) failed: %w", i, err)
+		}
+
 	}
 
 	// 所有片段发送完成后，发送 session_end 消息
@@ -120,13 +127,15 @@ func (at *AudioTranscriber) Run() []map[string]interface{} {
 	at.cleanupSplitFiles()
 	var results []map[string]interface{}
 	for res := range resultChan {
-		results = append(results, res)
+		if res != nil {
+			results = append(results, res)
+		}
 	}
 	go func() {
 		wg.Wait()
 
 	}()
-	return results
+	return results, nil
 }
 
 // 捕获退出信号
@@ -326,14 +335,14 @@ func (at *AudioTranscriber) getCachedResult(wavPath string, timeout time.Duratio
 }
 
 // WebSocket客户端
-func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string, resultChan chan<- map[string]interface{}, offset float64) {
+func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string, resultChan chan<- map[string]interface{}, offset float64) error {
 	u := url.URL{Scheme: "wss", Host: fmt.Sprintf("%s:%d", at.Host, at.Port), Path: "/"}
 	websocket.DefaultDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		resultChan <- nil
-		log.Fatal("连接失败:", err)
+		return fmt.Errorf("连接失败: %w", err)
 	}
 	defer c.Close()
 
@@ -350,13 +359,19 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 				resultChan <- nil
 				return
 			default:
+				c.SetReadDeadline(time.Now().Add(20 * time.Minute))
 				_, msg, err := c.ReadMessage()
 				if err != nil {
-					log.Println("读取消息失败:", err)
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						log.Printf("wsClient(%d): ReadMessage 超时(20分钟)，进入兜底取结果", id)
+					} else {
+						log.Println("读取消息失败:", err)
+					}
 					connFailed = true
 					resultChan <- nil
 					return
 				}
+				c.SetReadDeadline(time.Time{})
 				var asrResult ASRResult
 				if err := json.Unmarshal(msg, &asrResult); err != nil {
 					log.Println("解析JSON失败:", err)
@@ -426,7 +441,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	configMsg, _ := json.Marshal(config)
 	fmt.Printf("send: %s", configMsg)
 	if err := c.WriteMessage(websocket.TextMessage, configMsg); err != nil {
-		log.Fatal("发送配置失败:", err)
+		return fmt.Errorf("发送配置失败: %w", err)
 	}
 
 	// 发送音频数据
@@ -435,7 +450,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 
 	audioBytes, err := io.ReadAll(file)
 	if err != nil {
-		return
+		return fmt.Errorf("读取音频文件失败: %w", err)
 	}
 	//fmt.Println("len audio bytes", len(audioBytes))
 	//stride := int(60 * 10 * sampleRate * 2 / chunkInterval / 1000) // Simplified calculation for stride
@@ -449,7 +464,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	for i := 0; i < chunkNum; i++ {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		default:
 			beg := i * stride
 			//data := audio_bytes[beg : beg+stride]
@@ -461,7 +476,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 			//audioChunk := audioBytes[beg:end]
 			//fmt.Printf("send begin %d, end %d \n", beg, end)
 			if err := c.WriteMessage(websocket.BinaryMessage, audioBytes[beg:end]); err != nil {
-				log.Fatal("发送音频失败:", err)
+				return fmt.Errorf("发送音频失败: %w", err)
 			}
 
 			time.Sleep(1 * time.Microsecond)
@@ -475,7 +490,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	endMsg, _ := json.Marshal(end)
 	log.Println("end speaking.")
 	if err := c.WriteMessage(websocket.TextMessage, endMsg); err != nil {
-		log.Fatal("发送结束标记失败:", err)
+		return fmt.Errorf("发送结束标记失败: %w", err)
 	}
 
 	<-done
@@ -490,5 +505,8 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 			resultChan <- result
 			log.Printf("getCachedResult 成功")
 		}
+
 	}
+
+	return nil
 }
