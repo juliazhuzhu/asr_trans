@@ -70,6 +70,7 @@ type StampSent struct {
 // ASRResult ASR识别结果
 type ASRResult struct {
 	IsFinal    string      `json:"is_final"`
+	Status     string      `json:"status,omitempty"`
 	Text       string      `json:"text"`
 	Timestamp  [][]float64 `json:"timestamp"`
 	StampSents []StampSent `json:"stamp_sents"`
@@ -265,6 +266,65 @@ func (at *AudioTranscriber) sendSessionEnd() {
 	log.Printf("session_end: 服务端响应: %s", string(msg))
 }
 
+// getCachedResult 重连服务端查询缓存结果，每 30 秒重试，总超时 30 分钟
+func (at *AudioTranscriber) getCachedResult(wavPath string, timeout time.Duration) (map[string]interface{}, error) {
+	u := url.URL{Scheme: "wss", Host: fmt.Sprintf("%s:%d", at.Host, at.Port), Path: "/"}
+	websocket.DefaultDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+		if err != nil {
+			log.Printf("getCachedResult: 连接失败: %v，30秒后重试", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		reqMsg, _ := json.Marshal(map[string]interface{}{
+			"get_result": true,
+			"session_id": at.SessionID,
+			"wav_name":   wavPath,
+		})
+		if err := c.WriteMessage(websocket.TextMessage, reqMsg); err != nil {
+			log.Printf("getCachedResult: 发送失败: %v，30秒后重试", err)
+			c.Close()
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		// 设置读取超时，避免无限阻塞
+		c.SetReadDeadline(time.Now().Add(35 * time.Second))
+		_, msg, err := c.ReadMessage()
+		c.Close()
+		if err != nil {
+			log.Printf("getCachedResult: 读取失败: %v，30秒后重试", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		var asrResult ASRResult
+		if err := json.Unmarshal(msg, &asrResult); err != nil {
+			log.Printf("getCachedResult: 解析失败: %v，30秒后重试", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		if asrResult.IsFinal == "True" {
+			log.Printf("getCachedResult: 成功获取缓存结果")
+			resultBytes, _ := json.Marshal(asrResult)
+			var result map[string]interface{}
+			json.Unmarshal(resultBytes, &result)
+			return result, nil
+		}
+
+		// status == "not_found"，服务端还在处理或未收到请求
+		log.Printf("getCachedResult: 结果未就绪，30秒后重试")
+		time.Sleep(30 * time.Second)
+	}
+
+	return nil, fmt.Errorf("getCachedResult: 超时 (%v)", timeout)
+}
+
 // WebSocket客户端
 func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string, resultChan chan<- map[string]interface{}, offset float64) {
 	u := url.URL{Scheme: "wss", Host: fmt.Sprintf("%s:%d", at.Host, at.Port), Path: "/"}
@@ -278,34 +338,35 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	defer c.Close()
 
 	done := make(chan struct{})
+	connFailed := false // 标记是否因连接断开而退出
 
 	// 接收消息
 	go func() {
-		//defer close(done)
+		defer func() { done <- struct{}{} }() // 保证退出时总是通知 wsClient
 		for {
 
 			select {
 			case <-ctx.Done():
-				done <- struct{}{}
 				resultChan <- nil
 				return
 			default:
 				_, msg, err := c.ReadMessage()
 				if err != nil {
 					log.Println("读取消息失败:", err)
+					connFailed = true
+					resultChan <- nil
 					return
 				}
 				var asrResult ASRResult
 				if err := json.Unmarshal(msg, &asrResult); err != nil {
 					log.Println("解析JSON失败:", err)
-					done <- struct{}{}
 					resultChan <- nil
 					return
 				}
 
-				// 检查是否是最终结果
+				// 心跳/状态消息，继续等待
 				if asrResult.IsFinal != "True" {
-					return
+					continue
 				}
 
 				// 调整 stamp_sents 中的时间戳
@@ -343,7 +404,6 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 
 				resultChan <- result
 				log.Println("done part.")
-				done <- struct{}{}
 				return
 			}
 		}
@@ -419,4 +479,16 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	}
 
 	<-done
+
+	// 连接断开后尝试从服务端缓存获取结果
+	if connFailed {
+		log.Printf("连接断开，尝试从服务端缓存获取结果: %s", wavPath)
+		result, err := at.getCachedResult(wavPath, 30*time.Minute)
+		if err != nil {
+			log.Printf("getCachedResult 失败: %v", err)
+		} else {
+			resultChan <- result
+			log.Printf("getCachedResult 成功")
+		}
+	}
 }
