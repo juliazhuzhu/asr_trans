@@ -4,7 +4,29 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"asr_trans/pkg/log"
 )
+
+func initLogger() {
+	cfg := &log.Config{
+		Writers:          "stdout,file",
+		LoggerLevel:      "debug",
+		LoggerFile:       "./logs/asr_trans.log",
+		LoggerWarnFile:   "./logs/asr_trans.wf.log",
+		LoggerErrorFile:  "./logs/asr_trans.err.log",
+		LogFormatText:    false,
+		LogRollingPolicy: "daily",
+		LogRotateDate:    1,
+		LogRotateSize:    1,
+		LogBackupCount:   7,
+		AppName:          "asr_trans",
+	}
+	if err := log.NewLogger(cfg, log.InstanceZapLogger); err != nil {
+		fmt.Fprintf(os.Stderr, "init logger failed: %v\n", err)
+		os.Exit(1)
+	}
+}
 
 func main() {
 	host := flag.String("host", "127.0.0.1", "服务器地址")
@@ -12,20 +34,24 @@ func main() {
 	audioIn := flag.String("audio_in", "speaker123.wav", "输入音频文件路径")
 	flag.Parse()
 
+	initLogger()
+
 	if *audioIn == "" {
-		fmt.Fprintln(os.Stderr, "必须指定 audio_in 参数")
+		log.Error("必须指定 audio_in 参数")
 		os.Exit(1)
 	}
+
+	log.Infof("启动转写, host=%s, port=%d, audio_in=%s", *host, *port, *audioIn)
 
 	transcriber := NewAudioTranscriber(*host, *port, *audioIn)
 
 	ret, err := transcriber.Run()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "转写失败: %v\n", err)
+		log.Errorf("转写失败: %v", err)
 		os.Exit(1)
 	}
+
 	for _, result := range ret {
-		// 解析 sentences 字段（包含 speaker 信息）
 		if sentences, ok := result["sentences"].([]interface{}); ok {
 			fmt.Println("\n========== 识别结果（带说话人） ==========")
 			for _, val := range sentences {
@@ -39,12 +65,11 @@ func main() {
 			}
 		}
 
-		// 输出完整文本
 		if text, ok := result["text"].(string); ok {
 			fmt.Println("\n========== 完整文本 ==========")
 			fmt.Println(text)
 		}
 	}
 
-	//fmt.Println(ret)
+	log.Info("转写完成")
 }
