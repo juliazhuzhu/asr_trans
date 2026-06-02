@@ -118,7 +118,10 @@ func (at *AudioTranscriber) Run() ([]map[string]interface{}, error) {
 	offset := 3600000
 	for i, wavPath := range wavs {
 		log.Info("Session ID:%s, 开始处理第 %d 个片段: %s, offset=%.0f", at.SessionID, i, wavPath, float64(i*offset))
-		at.wsClient(ctx, i, wavPath, resultChan, float64(i*offset))
+		if err := at.wsClient(ctx, i, wavPath, resultChan, float64(i*offset)); err != nil {
+			log.Error("Session ID:%s, wsClient(%d) 处理失败: %v", at.SessionID, i, err)
+			return nil, fmt.Errorf("Session ID:%s, wsClient(%d) failed: %w", at.SessionID, i, err)
+		}
 		log.Info("Session ID:%s, wsClient(%d) 完成", at.SessionID, i)
 	}
 
@@ -350,7 +353,7 @@ func (at *AudioTranscriber) getCachedResult(wavPath string, timeout time.Duratio
 }
 
 // WebSocket客户端
-func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string, resultChan chan<- map[string]interface{}, offset float64) {
+func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string, resultChan chan<- map[string]interface{}, offset float64) error {
 	u := url.URL{Scheme: "wss", Host: fmt.Sprintf("%s:%d", at.Host, at.Port), Path: "/"}
 	websocket.DefaultDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 
@@ -359,7 +362,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	if err != nil {
 		log.Error("Session ID:%s, wsClient(%d): 连接失败: %v", at.SessionID, id, err)
 		resultChan <- nil
-		return
+		return fmt.Errorf("连接失败: %w", err)
 	}
 	defer c.Close()
 
@@ -459,21 +462,21 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	log.Info("Session ID:%s, wsClient(%d): 发送配置: %s", at.SessionID, id, string(configMsg))
 	if err := c.WriteMessage(websocket.TextMessage, configMsg); err != nil {
 		log.Error("Session ID:%s, wsClient(%d): 发送配置失败: %v", at.SessionID, id, err)
-		return
+		return fmt.Errorf("发送配置失败: %w", err)
 	}
 
 	// 发送音频数据
 	file, err := os.Open(wavPath)
 	if err != nil {
 		log.Error("Session ID:%s, wsClient(%d): 打开音频文件失败: %s, err=%v", at.SessionID, id, wavPath, err)
-		return
+		return fmt.Errorf("打开音频文件失败: %w", err)
 	}
 	defer file.Close()
 
 	audioBytes, err := io.ReadAll(file)
 	if err != nil {
 		log.Error("Session ID:%s, wsClient(%d): 读取音频文件失败: %v", at.SessionID, id, err)
-		return
+		return fmt.Errorf("读取音频文件失败: %w", err)
 	}
 
 	stride := int(float64(600) * float64(config.ChunkSize[1]) * float64(config.AudioFS) * 2.0 / float64(config.ChunkInterval) / 1000.0)
@@ -484,7 +487,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 		select {
 		case <-ctx.Done():
 			log.Info("Session ID:%s, wsClient(%d): context 取消，停止发送音频", at.SessionID, id)
-			return
+			return nil
 		default:
 			beg := i * stride
 			end := beg + stride
@@ -493,7 +496,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 			}
 			if err := c.WriteMessage(websocket.BinaryMessage, audioBytes[beg:end]); err != nil {
 				log.Error("Session ID:%s, wsClient(%d): 发送音频 chunk %d 失败: %v", at.SessionID, id, i, err)
-				return
+				return fmt.Errorf("发送音频失败: %w", err)
 			}
 
 			time.Sleep(1 * time.Microsecond)
@@ -509,7 +512,7 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 	log.Info("Session ID:%s, wsClient(%d): 发送结束标记", at.SessionID, id)
 	if err := c.WriteMessage(websocket.TextMessage, endMsg); err != nil {
 		log.Error("Session ID:%s, wsClient(%d): 发送结束标记失败: %v", at.SessionID, id, err)
-		return
+		return fmt.Errorf("发送结束标记失败: %w", err)
 	}
 
 	<-done
@@ -525,4 +528,6 @@ func (at *AudioTranscriber) wsClient(ctx context.Context, id int, wavPath string
 			log.Info("Session ID:%s, wsClient(%d): getCachedResult 成功", at.SessionID, id)
 		}
 	}
+
+	return nil
 }
